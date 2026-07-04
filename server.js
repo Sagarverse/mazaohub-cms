@@ -77,10 +77,8 @@ app.use('/api', async (req, res, next) => {
   }
 });
 
-// Serve static files only in the local Node server.
-if (!isVercel) {
-  app.use(express.static(path.join(__dirname, 'public')));
-}
+// Serve static assets in both local and Vercel environments.
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Authentication Middleware
 function requireAuth(req, res, next) {
@@ -282,15 +280,13 @@ app.post('/api/upload', requireAuth, upload.single('image'), async (req, res) =>
   }
 });
 
-// Fallback: serve index.html for non-API requests only in the local server.
-if (!isVercel) {
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api/')) {
-      return next();
-    }
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-  });
-}
+// Fallback: serve index.html for non-API requests in all environments.
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    return next();
+  }
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // Boot Database and Web Server
 dbReadyPromise
