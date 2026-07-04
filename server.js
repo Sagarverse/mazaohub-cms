@@ -12,6 +12,7 @@ const db = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isVercel = !!process.env.VERCEL;
 const JWT_SECRET = process.env.JWT_SECRET || 'mazaohub-cms-super-secret-key-12345';
 
 // Ensure uploads directories exist
@@ -272,11 +273,17 @@ app.get('*', (req, res, next) => {
 // Boot Database and Web Server
 db.initDb()
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`MazaoHub CMS Server running locally on http://localhost:${PORT}`);
-    });
+    if (!isVercel) {
+      app.listen(PORT, () => {
+        console.log(`MazaoHub CMS Server running locally on http://localhost:${PORT}`);
+      });
+    }
   })
   .catch(err => {
     console.error('CRITICAL ERROR: Failed to initialize DB connection. Server could not start.', err);
-    process.exit(1);
+    if (!isVercel) {
+      process.exit(1);
+    }
   });
+
+module.exports = app;

@@ -8,9 +8,12 @@ let dbType = 'postgres'; // default
 let pool = null;
 let mongoClient = null;
 let mongoDb = null;
+let memoryState = null;
 
 if (connectionString && (connectionString.startsWith('mongodb://') || connectionString.startsWith('mongodb+srv://'))) {
   dbType = 'mongodb';
+} else if (process.env.VERCEL && !process.env.DATABASE_URL && !process.env.MONGODB_URI) {
+  dbType = 'memory';
 } else if (!process.env.DATABASE_URL && !process.env.MONGODB_URI) {
   // If neither is specified, we default to local MongoDB (as it is running on the host system)
   dbType = 'mongodb';
@@ -20,6 +23,27 @@ console.log(`CMS Database Layer initialized with driver: [${dbType.toUpperCase()
 
 // Initialize Database Connections & Tables/Collections
 async function initDb() {
+  if (dbType === 'memory') {
+    const bcrypt = require('bcryptjs');
+    const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
+    const hash = await bcrypt.hash(defaultPassword, 10);
+
+    memoryState = {
+      users: [
+        {
+          id: 'memory-admin',
+          username: 'admin',
+          password_hash: hash,
+          created_at: new Date()
+        }
+      ],
+      content: {}
+    };
+
+    console.log('CMS Database Layer initialized with in-memory fallback storage.');
+    return;
+  }
+
   if (dbType === 'postgres') {
     const url = process.env.DATABASE_URL || 'postgres://localhost:5432/mazaohub';
     pool = new Pool({
@@ -118,6 +142,10 @@ async function initDb() {
 // DB-agnostic operations
 
 async function getUser(username) {
+  if (dbType === 'memory') {
+    return memoryState.users.find(user => user.username === username) || null;
+  }
+
   if (dbType === 'postgres') {
     const result = await pool.query('SELECT * FROM cms_users WHERE username = $1', [username]);
     if (result.rows.length > 0) {
@@ -138,6 +166,16 @@ async function getUser(username) {
 }
 
 async function getLiveContent() {
+  if (dbType === 'memory') {
+    const contentMap = {};
+    Object.entries(memoryState.content).forEach(([key, item]) => {
+      if (item.version === 'live') {
+        contentMap[key] = { value: item.value, type: item.type };
+      }
+    });
+    return contentMap;
+  }
+
   if (dbType === 'postgres') {
     const result = await pool.query("SELECT key, value, type FROM cms_content WHERE version = 'live'");
     const contentMap = {};
@@ -156,6 +194,24 @@ async function getLiveContent() {
 }
 
 async function getDraftContent() {
+  if (dbType === 'memory') {
+    const contentMap = {};
+
+    Object.entries(memoryState.content).forEach(([key, item]) => {
+      if (item.version === 'live') {
+        contentMap[key] = { value: item.value, type: item.type };
+      }
+    });
+
+    Object.entries(memoryState.content).forEach(([key, item]) => {
+      if (item.version === 'draft') {
+        contentMap[key] = { value: item.value, type: item.type };
+      }
+    });
+
+    return contentMap;
+  }
+
   if (dbType === 'postgres') {
     const result = await pool.query('SELECT key, value, type, version FROM cms_content');
     const contentMap = {};
@@ -192,6 +248,17 @@ async function getDraftContent() {
 }
 
 async function saveDraft(changes) {
+  if (dbType === 'memory') {
+    for (const [key, item] of Object.entries(changes)) {
+      memoryState.content[key] = {
+        value: item.value,
+        type: item.type,
+        version: 'draft'
+      };
+    }
+    return;
+  }
+
   if (dbType === 'postgres') {
     const client = await pool.connect();
     try {
@@ -225,6 +292,19 @@ async function saveDraft(changes) {
 }
 
 async function publishDraft() {
+  if (dbType === 'memory') {
+    Object.entries(memoryState.content).forEach(([key, item]) => {
+      if (item.version === 'draft') {
+        memoryState.content[key] = {
+          value: item.value,
+          type: item.type,
+          version: 'live'
+        };
+      }
+    });
+    return;
+  }
+
   if (dbType === 'postgres') {
     const client = await pool.connect();
     try {
@@ -263,6 +343,15 @@ async function publishDraft() {
 }
 
 async function discardDraft() {
+  if (dbType === 'memory') {
+    Object.keys(memoryState.content).forEach(key => {
+      if (memoryState.content[key].version === 'draft') {
+        delete memoryState.content[key];
+      }
+    });
+    return;
+  }
+
   if (dbType === 'postgres') {
     await pool.query("DELETE FROM cms_content WHERE version = 'draft'");
   } else {
