@@ -14,10 +14,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const isVercel = !!process.env.VERCEL;
 const JWT_SECRET = process.env.JWT_SECRET || 'mazaohub-cms-super-secret-key-12345';
+const dbReadyPromise = db.initDb();
 
 // Ensure uploads directories exist
 const tempUploadsDir = isVercel ? path.join('/tmp', 'mazaohub-temp_uploads') : path.join(__dirname, 'temp_uploads');
-if (!isVercel && !fs.existsSync(tempUploadsDir)) {
+if (!fs.existsSync(tempUploadsDir)) {
   fs.mkdirSync(tempUploadsDir, { recursive: true });
 }
 const localUploadsDir = path.join(__dirname, 'public', 'uploads');
@@ -64,6 +65,16 @@ app.use(cookieParser());
 app.use('/api', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   next();
+});
+
+app.use('/api', async (req, res, next) => {
+  try {
+    await dbReadyPromise;
+    next();
+  } catch (error) {
+    console.error('Database is not ready for request:', error);
+    res.status(500).json({ error: 'Server initialization failed.' });
+  }
 });
 
 // Serve static files only in the local Node server.
@@ -282,7 +293,7 @@ if (!isVercel) {
 }
 
 // Boot Database and Web Server
-db.initDb()
+dbReadyPromise
   .then(() => {
     if (!isVercel) {
       app.listen(PORT, () => {

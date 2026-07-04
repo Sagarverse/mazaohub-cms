@@ -2,96 +2,161 @@ const { Pool } = require('pg');
 const { MongoClient } = require('mongodb');
 require('dotenv').config();
 
+function isLocalMongoUri(uri) {
+  if (!uri) {
+    return false;
+  }
+
+  return uri.includes('127.0.0.1') || uri.includes('localhost');
+}
+
+function getEffectiveConnectionString() {
+  if (process.env.DATABASE_URL) {
+    return process.env.DATABASE_URL;
+  }
+
+  if (process.env.VERCEL && isLocalMongoUri(process.env.MONGODB_URI)) {
+    console.warn('Ignoring local MongoDB URI in Vercel environment.');
+    return null;
+  }
+
+  return process.env.MONGODB_URI;
+}
+
 // Determine database type based on environment variables
-const connectionString = process.env.DATABASE_URL || process.env.MONGODB_URI;
+const connectionString = getEffectiveConnectionString();
 let dbType = 'postgres'; // default
 let pool = null;
 let mongoClient = null;
 let mongoDb = null;
 let memoryState = null;
+let initPromise = null;
 
 if (connectionString && (connectionString.startsWith('mongodb://') || connectionString.startsWith('mongodb+srv://'))) {
   dbType = 'mongodb';
-} else if (process.env.VERCEL && !process.env.DATABASE_URL && !process.env.MONGODB_URI) {
+} else if (process.env.VERCEL && !connectionString) {
   dbType = 'memory';
-} else if (!process.env.DATABASE_URL && !process.env.MONGODB_URI) {
+} else if (!connectionString) {
   // If neither is specified, we default to local MongoDB (as it is running on the host system)
   dbType = 'mongodb';
 }
 
 console.log(`CMS Database Layer initialized with driver: [${dbType.toUpperCase()}]`);
 
+async function initializeMemoryState() {
+  const bcrypt = require('bcryptjs');
+  const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const hash = await bcrypt.hash(defaultPassword, 10);
+
+  memoryState = {
+    users: [
+      {
+        id: 'memory-admin',
+        username: 'admin',
+        password_hash: hash,
+        created_at: new Date()
+      }
+    ],
+    content: {}
+  };
+
+  dbType = 'memory';
+  console.log('CMS Database Layer initialized with in-memory fallback storage.');
+}
+
 // Initialize Database Connections & Tables/Collections
-async function initDb() {
+async function performInit() {
   if (dbType === 'memory') {
-    const bcrypt = require('bcryptjs');
-    const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
-    const hash = await bcrypt.hash(defaultPassword, 10);
-
-    memoryState = {
-      users: [
-        {
-          id: 'memory-admin',
-          username: 'admin',
-          password_hash: hash,
-          created_at: new Date()
-        }
-      ],
-      content: {}
-    };
-
-    console.log('CMS Database Layer initialized with in-memory fallback storage.');
+    await initializeMemoryState();
     return;
   }
 
-  if (dbType === 'postgres') {
-    const url = process.env.DATABASE_URL || 'postgres://localhost:5432/mazaohub';
-    pool = new Pool({
-      connectionString: url,
-      ssl: url.includes('neon.tech') || url.includes('supabase.co')
-        ? { rejectUnauthorized: false }
-        : false
-    });
+  try {
+    if (dbType === 'postgres') {
+      const url = process.env.DATABASE_URL || 'postgres://localhost:5432/mazaohub';
+      pool = new Pool({
+        connectionString: url,
+        ssl: url.includes('neon.tech') || url.includes('supabase.co')
+          ? { rejectUnauthorized: false }
+          : false
+      });
 
-    const client = await pool.connect();
-    try {
-      console.log('Initializing PostgreSQL tables...');
-      
-      // Create users table
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS cms_users (
-          id SERIAL PRIMARY KEY,
-          username VARCHAR(50) UNIQUE NOT NULL,
-          password_hash VARCHAR(255) NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
+      const client = await pool.connect();
+      try {
+        console.log('Initializing PostgreSQL tables...');
 
-      // Create content table
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS cms_content (
-          key VARCHAR(255) NOT NULL,
-          value TEXT NOT NULL,
-          type VARCHAR(50) DEFAULT 'text',
-          version VARCHAR(20) NOT NULL,
-          PRIMARY KEY (key, version)
-        );
-      `);
+        // Create users table
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS cms_users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
 
-      // Check user seed
-      const userCountResult = await client.query('SELECT COUNT(*) FROM cms_users');
-      const userCount = parseInt(userCountResult.rows[0].count, 10);
-      
+        // Create content table
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS cms_content (
+            key VARCHAR(255) NOT NULL,
+            value TEXT NOT NULL,
+            type VARCHAR(50) DEFAULT 'text',
+            version VARCHAR(20) NOT NULL,
+            PRIMARY KEY (key, version)
+          );
+        `);
+
+        // Check user seed
+        const userCountResult = await client.query('SELECT COUNT(*) FROM cms_users');
+        const userCount = parseInt(userCountResult.rows[0].count, 10);
+
+        if (userCount === 0) {
+          const bcrypt = require('bcryptjs');
+          const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
+          const hash = await bcrypt.hash(defaultPassword, 10);
+
+          await client.query(
+            'INSERT INTO cms_users (username, password_hash) VALUES ($1, $2)',
+            ['admin', hash]
+          );
+
+          console.log('================================================================');
+          console.log('  CMS DATABASE SEEDED SUCCESSFULLY');
+          console.log('  Created default admin user:');
+          console.log('  Username: admin');
+          console.log(`  Password: ${defaultPassword}`);
+          console.log('================================================================');
+        }
+      } finally {
+        client.release();
+      }
+    } else {
+      // MongoDB Initialization
+      const url = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
+      console.log(`Connecting to MongoDB at: ${url}...`);
+      mongoClient = new MongoClient(url);
+      await mongoClient.connect();
+      mongoDb = mongoClient.db('mazaohub_cms');
+
+      // Create unique index for content keys
+      await mongoDb.collection('cms_content').createIndex({ key: 1, version: 1 }, { unique: true });
+      await mongoDb.collection('cms_users').createIndex({ username: 1 }, { unique: true });
+
+      // Seed admin user
+      const usersCol = mongoDb.collection('cms_users');
+      const userCount = await usersCol.countDocuments({});
+
       if (userCount === 0) {
         const bcrypt = require('bcryptjs');
         const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
         const hash = await bcrypt.hash(defaultPassword, 10);
-        
-        await client.query(
-          'INSERT INTO cms_users (username, password_hash) VALUES ($1, $2)',
-          ['admin', hash]
-        );
-        
+
+        await usersCol.insertOne({
+          username: 'admin',
+          password_hash: hash,
+          created_at: new Date()
+        });
+
         console.log('================================================================');
         console.log('  CMS DATABASE SEEDED SUCCESSFULLY');
         console.log('  Created default admin user:');
@@ -99,44 +164,24 @@ async function initDb() {
         console.log(`  Password: ${defaultPassword}`);
         console.log('================================================================');
       }
-    } finally {
-      client.release();
     }
-  } else {
-    // MongoDB Initialization
-    const url = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
-    console.log(`Connecting to MongoDB at: ${url}...`);
-    mongoClient = new MongoClient(url);
-    await mongoClient.connect();
-    mongoDb = mongoClient.db('mazaohub_cms');
-    
-    // Create unique index for content keys
-    await mongoDb.collection('cms_content').createIndex({ key: 1, version: 1 }, { unique: true });
-    await mongoDb.collection('cms_users').createIndex({ username: 1 }, { unique: true });
-
-    // Seed admin user
-    const usersCol = mongoDb.collection('cms_users');
-    const userCount = await usersCol.countDocuments({});
-    
-    if (userCount === 0) {
-      const bcrypt = require('bcryptjs');
-      const defaultPassword = process.env.ADMIN_PASSWORD || 'admin123';
-      const hash = await bcrypt.hash(defaultPassword, 10);
-      
-      await usersCol.insertOne({
-        username: 'admin',
-        password_hash: hash,
-        created_at: new Date()
-      });
-
-      console.log('================================================================');
-      console.log('  CMS DATABASE SEEDED SUCCESSFULLY');
-      console.log('  Created default admin user:');
-      console.log('  Username: admin');
-      console.log(`  Password: ${defaultPassword}`);
-      console.log('================================================================');
+  } catch (error) {
+    if (process.env.VERCEL) {
+      console.error('Database initialization failed on Vercel. Falling back to in-memory storage.', error);
+      await initializeMemoryState();
+      return;
     }
+
+    throw error;
   }
+}
+
+function initDb() {
+  if (!initPromise) {
+    initPromise = performInit();
+  }
+
+  return initPromise;
 }
 
 // DB-agnostic operations
