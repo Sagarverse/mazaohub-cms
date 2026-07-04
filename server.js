@@ -16,17 +16,17 @@ const isVercel = !!process.env.VERCEL;
 const JWT_SECRET = process.env.JWT_SECRET || 'mazaohub-cms-super-secret-key-12345';
 
 // Ensure uploads directories exist
-const tempUploadsDir = path.join(__dirname, 'temp_uploads');
-if (!fs.existsSync(tempUploadsDir)) {
+const tempUploadsDir = isVercel ? path.join('/tmp', 'mazaohub-temp_uploads') : path.join(__dirname, 'temp_uploads');
+if (!isVercel && !fs.existsSync(tempUploadsDir)) {
   fs.mkdirSync(tempUploadsDir, { recursive: true });
 }
 const localUploadsDir = path.join(__dirname, 'public', 'uploads');
-if (!fs.existsSync(localUploadsDir)) {
+if (!isVercel && !fs.existsSync(localUploadsDir)) {
   fs.mkdirSync(localUploadsDir, { recursive: true });
 }
 
 // Multer setup for temporary file storage
-const upload = multer({ dest: 'temp_uploads/' });
+const upload = multer({ dest: tempUploadsDir });
 
 // Cloudinary setup
 const cloudinary = require('cloudinary').v2;
@@ -66,8 +66,10 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
+// Serve static files only in the local Node server.
+if (!isVercel) {
+  app.use(express.static(path.join(__dirname, 'public')));
+}
 
 // Authentication Middleware
 function requireAuth(req, res, next) {
@@ -246,6 +248,13 @@ app.post('/api/upload', requireAuth, upload.single('image'), async (req, res) =>
     }
     
     // Option C: Local fallback storage
+    if (isVercel) {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+      return res.status(501).json({ error: 'Image uploads on Vercel require Cloudinary or Supabase Storage.' });
+    }
+
     const filename = `${Date.now()}-${originalName.replace(/\s+/g, '_')}`;
     const targetPath = path.join(localUploadsDir, filename);
     
@@ -262,13 +271,15 @@ app.post('/api/upload', requireAuth, upload.single('image'), async (req, res) =>
   }
 });
 
-// Fallback: serve index.html for non-API requests (SPA client-side navigation)
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/')) {
-    return next();
-  }
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// Fallback: serve index.html for non-API requests only in the local server.
+if (!isVercel) {
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+      return next();
+    }
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  });
+}
 
 // Boot Database and Web Server
 db.initDb()
